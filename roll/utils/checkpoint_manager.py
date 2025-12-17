@@ -57,7 +57,7 @@ def model_path_cache(func):
 def download_model(model_name_or_path: str, local_dir: Optional[str] = None):
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
-
+    print(f"NOT FOUND MODEL {model_name_or_path}, TO BE DOWNLOAD!!!")
     model_download_type = os.getenv("MODEL_DOWNLOAD_TYPE", "MODELSCOPE")
     if model_download_type not in model_download_registry:
         raise ValueError(f"Unknown model_download_type: {model_download_type},"

@@ -18,6 +18,12 @@ class ActorWorker(BaseActorWorker):
         final_response_mask = data.batch.get("final_response_mask", response_mask)
         ref_log_probs = data.batch["ref_log_probs"]
         advantages = data.batch["advantages"]
+        values = data.batch["values"]
+        
+        # 计算token极性分布统计
+        scores = data.batch["scores"]
+        token_polarity_metrics = self._compute_token_polarity_metrics(advantages, values, response_mask, scores)
+        
 
         log_probs = self.strategy.op_compute_log_probs(
             logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=data.batch["response_mask"]
@@ -190,7 +196,8 @@ class ActorWorker(BaseActorWorker):
             "actor/sample_weights_max": sample_weights.max().detach().item(),
             **metrics,
             **loss_metric,
-            **train_infer_prob_metric
+            **train_infer_prob_metric,
+            **token_polarity_metrics,  # 添加token极性分布指标
         }
 
         return total_loss, pg_metrics
@@ -230,4 +237,136 @@ class ActorWorker(BaseActorWorker):
             sample_weights = sample_weights * (batch_size / (sample_weights.sum() + 1e-8))
 
         return sample_weights
+
+
+    def _compute_token_polarity_metrics(self, advantages: torch.Tensor, values: torch.Tensor, 
+                                        response_mask: torch.Tensor, scores: torch.Tensor):
+        """
+        计算token级别的极性和协同性分布统计
+        
+        Args:
+            advantages: 动作优势 (bs, seq_len)
+            values: 状态价值 (bs, seq_len)
+            response_mask: 响应mask (bs, seq_len)
+            scores: 样本得分 (bs,)
+            
+        Returns:
+            metrics: 包含各种token分布统计的字典
+        """
+        metrics = {
+            'distribution/sample_pos_ratio': 0.0,
+            'distribution/sample_neg_ratio': 0.0,
+            'distribution/token_pos_ratio': 0.0,
+            'distribution/token_neg_ratio': 0.0,
+            'distribution/sample_pos_token_pos_ratio': 0.0,
+            'distribution/sample_pos_token_neg_ratio': 0.0,
+            'distribution/sample_neg_token_pos_ratio': 0.0,
+            'distribution/sample_neg_token_neg_ratio': 0.0,
+            'distribution/synergy_pos_token_ratio': 0.0,
+            'distribution/synergy_neg_token_ratio': 0.0,
+            'distribution/sample_pos_synergy_pos_ratio': 0.0,
+            'distribution/sample_pos_synergy_neg_ratio': 0.0,
+            'distribution/sample_neg_synergy_pos_ratio': 0.0,
+            'distribution/sample_neg_synergy_neg_ratio': 0.0,
+        }
+        
+        # 基础Mask
+        valid_count = response_mask.sum()
+        if valid_count == 0:
+            return metrics
+
+        # 1. 样本极性 (Sample Polarity)
+        # 正样本: scores > 0
+        # 负样本: scores <= 0
+        sample_pos_mask = (scores > 0).float()
+        sample_neg_mask = (scores <= 0).float()
+        total_samples = scores.size(0)
+        
+        metrics['distribution/sample_pos_ratio'] = (sample_pos_mask.sum() / total_samples).item()
+        metrics['distribution/sample_neg_ratio'] = (sample_neg_mask.sum() / total_samples).item()
+
+        # 扩展样本Mask到Token级别
+        # (bs,) -> (bs, 1) -> (bs, seq_len)
+        token_sample_pos_mask = sample_pos_mask.unsqueeze(-1) * response_mask
+        token_sample_neg_mask = sample_neg_mask.unsqueeze(-1) * response_mask
+        
+        count_token_in_pos_sample = token_sample_pos_mask.sum()
+        count_token_in_neg_sample = token_sample_neg_mask.sum()
+
+        # 2. Token极性 (Token Polarity)
+        # 正Token: advantages > 0
+        # 负Token: advantages <= 0
+        token_pos_mask = (advantages > 0).float() * response_mask
+        token_neg_mask = (advantages <= 0).float() * response_mask
+        
+        # 总体正负Token比例
+        metrics['distribution/token_pos_ratio'] = (token_pos_mask.sum() / valid_count).item()
+        metrics['distribution/token_neg_ratio'] = (token_neg_mask.sum() / valid_count).item()
+
+        # 3. 正负样本内的正负Token比例
+        # 正样本内
+        if count_token_in_pos_sample > 0:
+            pos_token_in_pos_sample = (token_pos_mask * token_sample_pos_mask).sum()
+            neg_token_in_pos_sample = (token_neg_mask * token_sample_pos_mask).sum()
+            metrics['distribution/sample_pos_token_pos_ratio'] = (pos_token_in_pos_sample / count_token_in_pos_sample).item()
+            metrics['distribution/sample_pos_token_neg_ratio'] = (neg_token_in_pos_sample / count_token_in_pos_sample).item()
+        else:
+            metrics['distribution/sample_pos_token_pos_ratio'] = 0.0
+            metrics['distribution/sample_pos_token_neg_ratio'] = 0.0
+
+        # 负样本内
+        if count_token_in_neg_sample > 0:
+            pos_token_in_neg_sample = (token_pos_mask * token_sample_neg_mask).sum()
+            neg_token_in_neg_sample = (token_neg_mask * token_sample_neg_mask).sum()
+            metrics['distribution/sample_neg_token_pos_ratio'] = (pos_token_in_neg_sample / count_token_in_neg_sample).item()
+            metrics['distribution/sample_neg_token_neg_ratio'] = (neg_token_in_neg_sample / count_token_in_neg_sample).item()
+        else:
+            metrics['distribution/sample_neg_token_pos_ratio'] = 0.0
+            metrics['distribution/sample_neg_token_neg_ratio'] = 0.0
+
+        # 4. 协同性 (Synergy)
+        # 标准化 V 和 A
+        valid_values = values * response_mask
+        valid_advantages = advantages * response_mask
+        
+        values_mean = valid_values.sum() / valid_count
+        advantages_mean = valid_advantages.sum() / valid_count
+        
+        values_var = ((valid_values - values_mean * response_mask) ** 2 * response_mask).sum() / valid_count
+        advantages_var = ((valid_advantages - advantages_mean * response_mask) ** 2 * response_mask).sum() / valid_count
+        
+        values_std = torch.sqrt(values_var + 1e-8)
+        advantages_std = torch.sqrt(advantages_var + 1e-8)
+        
+        values_norm = (values - values_mean) / values_std
+        advantages_norm = (advantages - advantages_mean) / advantages_std
+
+        # 协同正Token: V_norm > 0 AND A_norm > 0
+        # 协同负Token: V_norm < 0 AND A_norm < 0
+        synergy_pos_mask = ((values_norm > 0) & (advantages_norm > 0)).float() * response_mask
+        synergy_neg_mask = ((values_norm < 0) & (advantages_norm < 0)).float() * response_mask
+
+        # 总体协同正负Token比例
+        metrics['distribution/synergy_pos_token_ratio'] = (synergy_pos_mask.sum() / valid_count).item()
+        metrics['distribution/synergy_neg_token_ratio'] = (synergy_neg_mask.sum() / valid_count).item()
+
+        # 5. 正负样本内的协同正负Token比例
+        # 正样本内
+        if count_token_in_pos_sample > 0:
+            syn_pos_in_pos_sample = (synergy_pos_mask * token_sample_pos_mask).sum()
+            syn_neg_in_pos_sample = (synergy_neg_mask * token_sample_pos_mask).sum()
+            metrics['distribution/sample_pos_synergy_pos_ratio'] = (syn_pos_in_pos_sample / count_token_in_pos_sample).item()
+            metrics['distribution/sample_pos_synergy_neg_ratio'] = (syn_neg_in_pos_sample / count_token_in_pos_sample).item()
+        else:
+            metrics['distribution/sample_pos_synergy_pos_ratio'] = 0.0
+            metrics['distribution/sample_pos_synergy_neg_ratio'] = 0.0
+
+        # 负样本内
+        if count_token_in_neg_sample > 0:
+            syn_pos_in_neg_sample = (synergy_pos_mask * token_sample_neg_mask).sum()
+            syn_neg_in_neg_sample = (synergy_neg_mask * token_sample_neg_mask).sum()
+            metrics['distribution/sample_neg_synergy_pos_ratio'] = (syn_pos_in_neg_sample / count_token_in_neg_sample).item()
+            metrics['distribution/sample_neg_synergy_neg_ratio'] = (syn_neg_in_neg_sample / count_token_in_neg_sample).item()
+            
+        return metrics
 
