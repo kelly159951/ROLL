@@ -10,6 +10,10 @@ from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 
 from roll.pipeline.rlvr.rlvr_pipeline import RLVRPipeline
 
+# import debugpy
+# debugpy.listen(23322)
+# print("Waiting for debugger attach")
+# debugpy.wait_for_client()
 
 def main():
     parser = argparse.ArgumentParser()

@@ -13,3 +13,9 @@ benchmark_core:
 
 benchmark_aux:
 	bash ./benchmark/benchmark_aux.sh
+
+
+qwen3-1.7B-rlvr_megatron:
+	export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+	export WANDB_MODE=offline
+	bash examples/qwen3-1.7B-rlvr_megatron/run_rlvr_pipeline.sh
