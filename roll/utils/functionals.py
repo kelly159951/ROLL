@@ -723,6 +723,8 @@ def compute_advantage(
     whiten_advantages=False,
     whiten_rewards=False,
     response_mask=None,
+    lambd_actor=None,
+    lambd_critic=None,
 ):
     if response_mask is None:
         response_mask = data.batch["response_mask"][:, 1:]
@@ -739,9 +741,23 @@ def compute_advantage(
     if adv_estimator == "gae":
         values = data.batch["values"].float()
         data.batch["values"] = values * response_mask
-        advantages, returns = compute_gae_advantage_return(
-            token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd
-        )
+        # Decoupled GAE: only compute twice if lambdas are different
+        if lambd_actor is not None or lambd_critic is not None:
+            lambd_for_actor = lambd_actor if lambd_actor is not None else lambd
+            lambd_for_critic = lambd_critic if lambd_critic is not None else lambd
+            # Compute advantages for actor
+            advantages, _ = compute_gae_advantage_return(
+                token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd_for_actor
+            )
+            # Compute returns for critic
+            _, returns = compute_gae_advantage_return(
+                token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd_for_critic
+            )
+        else:
+            # Original way: compute once
+            advantages, returns = compute_gae_advantage_return(
+                token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd
+            )
     elif adv_estimator in ["reinforce", "grpo", "gigpo", "step_reinforce"]:
         advantages, returns = compute_reinforce_return(
             token_level_rewards=token_level_rewards, gamma=gamma, lambd=lambd

@@ -98,6 +98,17 @@ class RLVRConfig(PPOConfig):
             "help": "generate optimizing level: 0 use base batch generate interface, 1 use scheduler process requests"
         },
     )
+    
+    # Decoupled GAE lambdas (VAPO-style)
+    lambd_actor: float = field(
+        default=None,
+        metadata={"help": "GAE lambda for actor/policy network. If None, use lambd."}
+    )
+    lambd_critic: float = field(
+        default=None,
+        metadata={"help": "GAE lambda for critic/value network. If None, use lambd."}
+    )
+    
     is_num_return_sequences_expand: bool = field(
         default=False,
         metadata={"help": "whether replicate `num_return_sequences` times in prompts or not."}

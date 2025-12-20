@@ -665,6 +665,8 @@ class RLVRPipeline(BasePipeline):
                             whiten_advantages=self.pipeline_config.whiten_advantages,
                             whiten_rewards=self.pipeline_config.whiten_rewards,
                             response_mask=final_response_mask,
+                            lambd_actor=self.pipeline_config.lambd_actor,
+                            lambd_critic=self.pipeline_config.lambd_critic,
                         )
                         domain_metrics = reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         metrics_mgr.add_domain_metrics(domain, domain_metrics)
@@ -709,7 +711,7 @@ class RLVRPipeline(BasePipeline):
 
                     with actor_train_timer:
                         # implement critic warmup
-                        if self.pipeline_config.critic_warmup <= global_step:
+                        if self.pipeline_config.critic_warmup <= global_step: # warmup: 只训练critic model 不更新actor
                             # update actor
                             if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
                                 batch, dynamic_batching_metrics = dynamic_batching_shard(

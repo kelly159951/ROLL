@@ -1,7 +1,7 @@
 wandb/
 /models
 
-
+/.sii
 
 # Ignore all png files
 *.png
