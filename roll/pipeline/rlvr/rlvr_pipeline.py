@@ -128,6 +128,7 @@ class RLVRPipeline(BasePipeline):
 
     def __init__(self, pipeline_config: RLVRConfig):
         super().__init__(pipeline_config)
+        #基础初始化
         self.pipeline_config = pipeline_config
         self.is_lora = is_lora_training(self.pipeline_config)
         scheduler_cls = (
@@ -135,6 +136,7 @@ class RLVRPipeline(BasePipeline):
         )
         self.tokenizer = default_tokenizer_provider(model_args=self.pipeline_config.actor_train.model_args)
 
+        #准备数据集
         dataset_paths = []
         if self.pipeline_config.actor_train.data_args.file_name:
             dataset_paths.extend(self.pipeline_config.actor_train.data_args.file_name)
@@ -195,6 +197,7 @@ class RLVRPipeline(BasePipeline):
         assert "domain" in dataset.column_names, "domain field should set in dataset"
         print(dataset)
 
+        #KL控制器
         self.kl_ctrl = get_kl_controller(
             init_kl_coef=self.pipeline_config.init_kl_coef,
             target_kl=self.pipeline_config.target_kl,
@@ -204,13 +207,14 @@ class RLVRPipeline(BasePipeline):
         assert self.pipeline_config.max_steps > 0, "max_steps must be greater than 0"
         self.pipeline_config.set_max_steps(max_steps=self.pipeline_config.max_steps)
 
-        self.actor_train: Any = Cluster(
+        # 创建并初始化各个分布式训练组件
+        self.actor_train: Any = Cluster( # 策略模型训练集群
             name=self.pipeline_config.actor_train.name,
             worker_cls=self.pipeline_config.actor_train.worker_cls,
             resource_manager=self.resource_manager,
             worker_config=self.pipeline_config.actor_train,
         )
-        self.actor_infer: Any = Cluster(
+        self.actor_infer: Any = Cluster( # 策略模型推理集群
             name=self.pipeline_config.actor_infer.name,
             worker_cls=self.pipeline_config.actor_infer.worker_cls,
             resource_manager=self.resource_manager,
@@ -219,7 +223,7 @@ class RLVRPipeline(BasePipeline):
         download_clusters = [self.actor_train, self.actor_infer]
         # use unwrapped model as reference for lora training
         if not self.is_lora and self.pipeline_config.enable_reference:
-            self.reference: Any = Cluster(
+            self.reference: Any = Cluster( # 参考模型集群 (用于计算 KL)
                 name=self.pipeline_config.reference.name,
                 worker_cls=self.pipeline_config.reference.worker_cls,
                 resource_manager=self.resource_manager,
@@ -227,15 +231,15 @@ class RLVRPipeline(BasePipeline):
             )
             download_clusters.append(self.reference)
         if self.pipeline_config.adv_estimator == "gae":
-            self.critic: Any = Cluster(
+            self.critic: Any = Cluster( # 价值模型集群 (V(s),用于计算GAE优势估计)：与actor相同的语言模型+线性层价值头
                 name=self.pipeline_config.critic.name,
                 worker_cls=self.pipeline_config.critic.worker_cls,
                 resource_manager=self.resource_manager,
                 worker_config=self.pipeline_config.critic,
             )
             download_clusters.append(self.critic)
-        self.rewards: Dict[str, Any] = {
-            key: Cluster(
+        self.rewards: Dict[str, Any] = { #奖励模型集群字典 (支持多 domain)
+            key: Cluster( 
                 name=f"reward-{key}",
                 worker_cls=worker_config.worker_cls,
                 resource_manager=self.resource_manager,
@@ -246,6 +250,7 @@ class RLVRPipeline(BasePipeline):
         download_clusters.extend(self.rewards.values())
         self.download_models(*download_clusters)
 
+        # 生成调度器配置
         domain_ratios = self.pipeline_config.actor_train.data_args.domain_interleave_probs
         self.generate_schedulers: Dict[str, DynamicSamplingScheduler] = {}
         self.domain_batch_size = {}
@@ -413,7 +418,7 @@ class RLVRPipeline(BasePipeline):
         except Exception as e:
             logger.info(f"Writing files catch error :{e}")
 
-    def get_generation_config(self, generating_args: Optional[GeneratingArguments] = None):
+    def get_generation_config(self, generating_args: Optional[GeneratingArguments] = None): # 获取并构建文本生成的配置字典
         generating_args = (
             generating_args if generating_args is not None else self.actor_infer.worker_config.generating_args
         )
@@ -428,7 +433,7 @@ class RLVRPipeline(BasePipeline):
 
         # 创建一个专门管理监控指标的类
         metrics_mgr = MetricsManager()
-
+        # 初始化各种计时器
         tps_timer = _Timer(window_size=5)
         actor_infer_timer = _Timer(window_size=5)
         actor_infer_response_timer = _Timer(window_size=5)
@@ -440,33 +445,33 @@ class RLVRPipeline(BasePipeline):
         metrics_mgr.timers["actor_train"] = actor_train_timer
 
         pre_step_total_time = 0
-        if self.pipeline_config.async_pipeline and self.pipeline_config.generate_opt_level == 1:
+        if self.pipeline_config.async_pipeline and self.pipeline_config.generate_opt_level == 1: # 异步流水线+优化级别1时预加载reward模型
             for reward_cluster in self.rewards.values():
                 reward_cluster.load_states()
 
         first_step = True
         for global_step in range(self.pipeline_config.max_steps):
-            if global_step <= self.state.step:
+            if global_step <= self.state.step: #用于断点续训，跳过已完成步骤
                 global_step += 1
                 continue
             logger.info(f"pipeline step {global_step} start...")
             should_eval = self.val_dataset and global_step % self.pipeline_config.eval_steps == 0
 
-            metrics_mgr.clear_metrics()
-            with tps_timer, Timer(name="step_total", logger=None) as step_total_timer:
+            metrics_mgr.clear_metrics() # 清空已收集指标数据
+            with tps_timer, Timer(name="step_total", logger=None) as step_total_timer: # 监控吞吐量和单步耗时
                 # if global_step > self.state.step + 1:
                 logger.info(f"pre_step_total_time: {pre_step_total_time}")
                 metrics_mgr.add_metric("time/step_total", pre_step_total_time)
-                batch: DataProto = DataProto(
+                batch: DataProto = DataProto( # 创建数据协议对象，用于在分布式训练的不同组件之间传递数据
                     meta_info={"global_step": global_step, "collect_unfinished": self.pipeline_config.async_pipeline}
                 )
 
-                # 先model update，resume时不需要保存infer cluster的状态
+                # 先model update，resume时不需要保存infer cluster的状态，暂时卸载模型，空余出GPU
                 if self.pipeline_config.adv_estimator == "gae":
                     self.critic.offload_states(blocking=True)
                 self.actor_train.offload_states(blocking=True)
 
-                with Timer(name="step_stop_server", logger=None) as step_stop_server_timer:
+                with Timer(name="step_stop_server", logger=None) as step_stop_server_timer:  # 停止推理服务器，防止并发冲突（模型更新的时候推理还在进行）
                     if self.pipeline_config.async_pipeline and not first_step and self.pipeline_config.generate_opt_level == 1:
                         scheduler_refs = []
                         for scheduler in self.generate_schedulers.values():
@@ -475,14 +480,14 @@ class RLVRPipeline(BasePipeline):
                         self.actor_infer.stop_server()
                 metrics_mgr.add_metric("time/step_stop_server", step_stop_server_timer.last)
 
-                with Timer(name="step_model_update", logger=None) as step_model_update_timer:
-                    model_update_metrics: Dict = self.model_update(global_step)
+                with Timer(name="step_model_update", logger=None) as step_model_update_timer: # 模型参数同步和配置更新
+                    model_update_metrics: Dict = self.model_update(global_step) # 将actor train最新参数同步到actor infer，并返回同步过程的性能指标
                     metrics_mgr.add_metrics(model_update_metrics)
-                    batch.meta_info["generation_config"] = self.get_generation_config()
+                    batch.meta_info["generation_config"] = self.get_generation_config() # 将文本生成的配置参数存入批次数据的元信息中
                 metrics_mgr.add_metric("time/step_model_update", step_model_update_timer.last)
 
                 if should_eval and not self.pipeline_config.async_pipeline:
-                    with Timer(name="val_step", logger=None) as val_step_timer:
+                    with Timer(name="val_step", logger=None) as val_step_timer: # 执行模型验证，评估模型在验证集上的表现
                         val_metrics = self.val()
                     metrics_mgr.add_metrics(val_metrics)
                     metrics_mgr.add_metric("time/val_step", val_step_timer.last)
@@ -781,21 +786,21 @@ class RLVRPipeline(BasePipeline):
         logger.info("pipeline complete!")
 
     @torch.no_grad()
-    def val(self):
-        val_metrics_mgr = MetricsManager()
-        batch = DataProto()
+    def val(self): # 验证函数
+        val_metrics_mgr = MetricsManager() # 指标管理器，收集验证指标
+        batch = DataProto() #数据批次对象
 
         with Timer(name="step_generate", logger=None) as step_generate_timer:
             batch.meta_info["is_offload_states"] = False
             batch.meta_info["generation_config"] = self.pipeline_config.validation.generating_args.to_dict()
             if not self.pipeline_config.async_pipeline:
-                self.actor_infer.start_server(data=DataProto(meta_info=batch.meta_info))
-                for reward_cluster in self.rewards.values():
+                self.actor_infer.start_server(data=DataProto(meta_info=batch.meta_info)) # 根据配置启动推理服务器
+                for reward_cluster in self.rewards.values(): # 加载奖励模型状态（从cpu传回gpu）
                     reward_cluster.load_states()
-            generate_output: DataProto = ray.get(
+            generate_output: DataProto = ray.get( # 远程调用actor infer批量生成结果
                 self.val_generate_scheduler.get_batch.remote(data=batch, batch_size=len(self.val_dataset)),
                 timeout=self.pipeline_config.rpc_timeout,
-            )
+            ) # ray.get() - 阻塞等待远程任务完成并获取结果；.remote() - 标记这是一个异步的远程方法调用
             if not self.pipeline_config.async_pipeline and self.pipeline_config.generate_opt_level == 1:
                 self.actor_infer.stop_server()
                 for reward_cluster in self.rewards.values():
@@ -808,9 +813,9 @@ class RLVRPipeline(BasePipeline):
         val_metrics_mgr.add_metric("val_correct/all/mean", val_correct_mean)
         logger.info(json.dumps({"val_correct/all/mean": val_correct_mean}, ensure_ascii=False))
 
-        epoch_batch = batch.pop(batch_keys=["scores"], non_tensor_batch_keys=["tag"])
+        epoch_batch = batch.pop(batch_keys=["scores"], non_tensor_batch_keys=["tag"]) # 提取scores 和 tag
 
-        grouped_batch = epoch_batch.group_by("tag")
+        grouped_batch = epoch_batch.group_by("tag") # 按tag分组
         for group_key, group_batch in grouped_batch.items():
             score_mean = group_batch.batch["scores"].mean().item()
             logger.info(f"val_correct/{group_key}:  {score_mean}")
