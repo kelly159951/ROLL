@@ -440,11 +440,12 @@ def compute_reinforce_return(token_level_rewards: torch.Tensor, gamma: torch.Ten
         returns = advantages
     return advantages, returns
 
-
 def compute_gae_advantage_return(
-    token_level_rewards: torch.Tensor, values: torch.Tensor, gamma: torch.Tensor, lambd: torch.Tensor
+    token_level_rewards: torch.Tensor, values: torch.Tensor, gamma: float, lambd: Union[float, torch.Tensor]
 ):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
+    
+    Supports both scalar lambda (original behavior) and per-sample lambda (for dynamic GAE).
 
     Args:
         token_level_rewards: `(torch.Tensor)`
@@ -453,8 +454,10 @@ def compute_gae_advantage_return(
             shape: (bs, response_length)
         gamma: `(float)`
             discounted factor used in RL
-        lambd: `(float)`
-            lambda value when computing Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+        lambd: `(float or torch.Tensor)`
+            lambda value(s) for GAE. Can be:
+            - float: same lambda for all samples (original behavior)
+            - torch.Tensor (bs,) or (bs, 1): per-sample lambda values (dynamic GAE)
 
     Returns:
         advantages: `(torch.Tensor)`
@@ -464,9 +467,15 @@ def compute_gae_advantage_return(
 
     """
     with torch.no_grad():
-        lastgaelam = 0
-        advantages_reversed = []
+        batch_size = token_level_rewards.shape[0]
         gen_len = token_level_rewards.shape[-1]
+        
+        if isinstance(lambd, torch.Tensor): # Check if lambd is per-sample (tensor) or scalar
+            lastgaelam = torch.zeros(batch_size, device=token_level_rewards.device)
+        else:
+            lastgaelam = 0
+        
+        advantages_reversed = []
 
         for t in reversed(range(gen_len)):
             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
@@ -478,6 +487,7 @@ def compute_gae_advantage_return(
         returns = advantages + values
 
     return advantages, returns
+
 
 
 def expand_to_token_level(data: "DataProto"):
@@ -741,14 +751,35 @@ def compute_advantage(
     if adv_estimator == "gae":
         values = data.batch["values"].float()
         data.batch["values"] = values * response_mask
-        # Decoupled GAE: only compute twice if lambdas are different
-        if lambd_actor is not None or lambd_critic is not None:
+        
+        # Check if we need dynamic lambda for actor
+        use_dynamic_lambd = data.meta_info.get("use_dynamic_lambd_actor", False)
+        dynamic_lambd_alpha = data.meta_info.get("dynamic_lambd_alpha", 1.0)
+        
+        # Decoupled GAE
+        if lambd_actor is not None or lambd_critic is not None or use_dynamic_lambd:
             lambd_for_actor = lambd_actor if lambd_actor is not None else lambd
             lambd_for_critic = lambd_critic if lambd_critic is not None else lambd
+            
             # Compute advantages for actor
-            advantages, _ = compute_gae_advantage_return(
-                token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd_for_actor
-            )
+            if use_dynamic_lambd:
+                # Calculate per-sample lambda based on sequence length: λ = 1 - 1/(α*length)
+                seq_lengths = response_mask.sum(dim=1).float()  # (bs,)
+                lambd_dynamic = 1.0 - 1.0 / (dynamic_lambd_alpha * seq_lengths.clamp(min=1.0))
+                lambd_dynamic = lambd_dynamic.clamp(min=0.0, max=1.0)  # Ensure valid range [0, 1]
+                # Log dynamic lambda stats
+                data.meta_info["metrics"] = data.meta_info.get("metrics", {})
+                data.meta_info["metrics"]["gae/lambd_actor_mean"] = lambd_dynamic.mean().item()
+                data.meta_info["metrics"]["gae/lambd_actor_min"] = lambd_dynamic.min().item()
+                data.meta_info["metrics"]["gae/lambd_actor_max"] = lambd_dynamic.max().item()
+                advantages, _ = compute_gae_advantage_return(
+                    token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd_dynamic
+                )
+            else:
+                advantages, _ = compute_gae_advantage_return(
+                    token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd_for_actor
+                )
+            
             # Compute returns for critic
             _, returns = compute_gae_advantage_return(
                 token_level_rewards=token_level_rewards, values=values, gamma=gamma, lambd=lambd_for_critic

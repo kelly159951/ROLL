@@ -109,6 +109,16 @@ class RLVRConfig(PPOConfig):
         metadata={"help": "GAE lambda for critic/value network. If None, use lambd."}
     )
     
+    # Dynamic lambda for actor based on sequence length
+    use_dynamic_lambd_actor: bool = field(
+        default=False,
+        metadata={"help": "Whether to use dynamic lambda for actor based on sequence length: λ = 1 - 1/(α*length)"}
+    )
+    dynamic_lambd_alpha: float = field(
+        default=1.0,
+        metadata={"help": "Alpha parameter for dynamic lambda calculation: λ = 1 - 1/(α*length)"}
+    )
+    
     is_num_return_sequences_expand: bool = field(
         default=False,
         metadata={"help": "whether replicate `num_return_sequences` times in prompts or not."}

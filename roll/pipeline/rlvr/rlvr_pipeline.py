@@ -656,6 +656,10 @@ class RLVRPipeline(BasePipeline):
                     # 4. 计算advantage
                     final_response_mask = domain_batch.batch["final_response_mask"].clone()
                     with Timer(name="compute_advantage", logger=None) as compute_advantage_timer:
+                        # Pass dynamic lambda config to meta_info
+                        domain_batch.meta_info["use_dynamic_lambd_actor"] = self.pipeline_config.use_dynamic_lambd_actor
+                        domain_batch.meta_info["dynamic_lambd_alpha"] = self.pipeline_config.dynamic_lambd_alpha
+                        
                         domain_batch = compute_advantage(
                             data=domain_batch,
                             gamma=self.pipeline_config.gamma,
