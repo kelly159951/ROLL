@@ -71,8 +71,8 @@ length_loss_weight: false
 # advantage
 whiten_advantages: true
 
-pretrain: Qwen/Qwen3-8B
-reward_pretrain: Qwen/Qwen3-8B
+pretrain: ./models/Qwen3-8B-Base
+reward_pretrain: ${pretrain}
 
 validation:
   data_args:

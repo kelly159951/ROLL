@@ -72,8 +72,8 @@ length_loss_weight: false
 whiten_advantages: true
 entropy_top_ratio: 0.2
 
-pretrain: Qwen/Qwen3-8B
-reward_pretrain: Qwen/Qwen3-8B
+pretrain: ./models/Qwen3-8B-Base
+reward_pretrain: ${pretrain}
 
 validation:
   data_args:
