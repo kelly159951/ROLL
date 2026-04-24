@@ -1,0 +1,171 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen3-8B-rlvr-4gpu-entropy-top20"
+seed: 42
+logging_dir: ./output/logs
+output_dir: ./output
+system_envs:
+  USE_MODELSCOPE: '1'
+
+checkpoint_config:
+  type: file_system
+  output_dir: ./output/models/${exp_name}
+
+track_with: wandb
+tracker_kwargs:
+  project: attention-rlvr
+  name: ${exp_name}
+  log_dir: ./output/wandb
+  tags:
+    - qwen3-8b
+    - rlvr
+    - entropy-top20
+  mode: online
+
+num_nodes: 1
+num_gpus_per_node: 4
+
+max_steps: 200
+save_steps: 50
+logging_steps: 1
+eval_steps: 20
+resume_from_checkpoint: false
+
+rollout_batch_size: 8
+prompt_length: 2048
+response_length: 4096
+
+num_return_sequences_in_group: 4
+ppo_epochs: 1
+adv_estimator: "reinforce"
+
+# DAPO-style no-KL setup for a smaller 4-GPU run.
+init_kl_coef: 0
+use_kl_loss: false
+add_token_level_kl: false
+
+# clip
+value_clip: 0.5
+reward_clip: 10
+advantage_clip: 2.0
+dual_clip_loss: true
+
+# normalize
+norm_mean_type: ~
+norm_std_type: ~
+
+# data mask
+max_len_mask: true
+difficulty_mask: true
+difficulty_low_threshold: 0.1
+difficulty_high_threshold: 0.95
+error_max_len_clip: false
+
+# data weight
+difficulty_loss_weight: false
+length_loss_weight: false
+
+# advantage
+whiten_advantages: true
+entropy_top_ratio: 0.2
+
+pretrain: Qwen/Qwen3-8B
+reward_pretrain: Qwen/Qwen3-8B
+
+validation:
+  data_args:
+    template: qwen3
+    file_name:
+      - data/math_benchmarks.jsonl
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.6
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: 1
+
+actor_train:
+  model_args:
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 4
+    warmup_steps: 20
+    num_train_epochs: 50
+  data_args:
+    template: qwen3
+    file_name:
+      - data/math_deepmath_deal.jsonl
+    domain_interleave_probs:
+      math_rule: 1.0
+    dataset_dir: .
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 16
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+
+actor_infer:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.99
+    num_return_sequences: ${num_return_sequences_in_group}
+  data_args:
+    template: qwen3
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.8
+      block_size: 16
+      max_model_len: 8000
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+
+reference:
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: qwen3
+  strategy_args:
+    strategy_name: megatron_infer
+    strategy_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 1
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+
+rewards:
+  math_rule:
+    worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    data_args:
+      template: qwen3
+    tag_included: [deepmath_103k, aime]
+    world_size: 1
+    infer_batch_size: 1

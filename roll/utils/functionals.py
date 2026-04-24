@@ -608,6 +608,25 @@ def difficulty_mask(data: "DataProto", n_sample=-1, low_threshold=0.1, high_thre
     return data
 
 
+def get_global_entropy_top_mask(entropy: torch.Tensor, response_mask: torch.Tensor, top_ratio: float):
+    if not 0 <= top_ratio <= 1:
+        raise ValueError(f"top_ratio must be in [0, 1], got {top_ratio}")
+
+    flat_mask = response_mask.reshape(-1).bool()
+    flat_out = torch.zeros_like(flat_mask)
+    if top_ratio == 0 or flat_mask.sum() == 0:
+        return flat_out.view_as(response_mask)
+
+    flat_entropy = entropy.reshape(-1)
+    response_entropy = flat_entropy[flat_mask]
+    top_k = min(response_entropy.numel(), max(1, int(response_entropy.numel() * top_ratio + 0.9999)))
+    _, topk_idx = torch.topk(response_entropy, k=top_k)
+
+    response_positions = flat_mask.nonzero(as_tuple=False).squeeze(1)
+    flat_out[response_positions[topk_idx]] = True
+    return flat_out.view_as(response_mask)
+
+
 @torch.no_grad()
 def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl: AdaptiveKLController):
     token_level_rewards = expand_to_token_level(data)
@@ -839,9 +858,26 @@ def compute_advantage(
         advantages = masked_whiten(values=advantages, mask=response_mask)
     advantages = advantages * response_mask
 
+    entropy_top_ratio = getattr(pipeline_config, "entropy_top_ratio", None) if pipeline_config else None
+    if entropy_top_ratio is not None:
+        if "old_entropy" not in data.batch.keys():
+            raise ValueError("entropy_top_ratio requires old_entropy in the batch.")
+        entropy_top_mask = get_global_entropy_top_mask(
+            entropy=data.batch["old_entropy"].to(device=advantages.device),
+            response_mask=response_mask,
+            top_ratio=entropy_top_ratio,
+        )
+        advantages = advantages * entropy_top_mask.to(dtype=advantages.dtype)
+
+        metrics = data.meta_info.setdefault("metrics", {})
+        selected_tokens = (entropy_top_mask & response_mask.bool()).sum().float()
+        total_tokens = response_mask.sum().float()
+        metrics["critic/entropy_top_ratio"] = float(entropy_top_ratio)
+        metrics["critic/entropy_top_mask_ratio"] = (selected_tokens / torch.clamp(total_tokens, min=1.0)).item()
+
     if advantage_clip is not None:
         adv_clip_frac = compute_clip_fraction(values=advantages, clip_min=-advantage_clip, clip_max=advantage_clip)
-        data.meta_info["metrics"] = {"critic/advantage_clip_frac": adv_clip_frac}
+        data.meta_info.setdefault("metrics", {})["critic/advantage_clip_frac"] = adv_clip_frac
         advantages = torch.clamp(advantages, min=-advantage_clip, max=advantage_clip)
 
     data.batch["advantages"] = advantages
