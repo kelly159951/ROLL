@@ -23,7 +23,7 @@ tracker_kwargs:
     - qwen3-8b
     - rlvr
     - baseline
-  mode: online
+  mode: offline
 
 num_nodes: 1
 num_gpus_per_node: 4
