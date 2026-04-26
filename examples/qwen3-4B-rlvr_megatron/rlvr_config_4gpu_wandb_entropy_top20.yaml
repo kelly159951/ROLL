@@ -3,7 +3,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "qwen3-8B-rlvr-4gpu-baseline"
+exp_name: "qwen3-4B-rlvr-4gpu-entropy-top20"
 seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
@@ -21,14 +21,14 @@ tracker_kwargs:
   name: ${exp_name}
   log_dir: ./output/wandb
   tags:
-    - qwen3-8b
+    - qwen3-4b
     - rlvr
-    - baseline
+    - entropy-top20
   mode: offline
 
 num_gpus_per_node: 4
 
-max_steps: 500
+max_steps: 400
 save_steps: 100
 logging_steps: 1
 eval_steps: 10
@@ -68,13 +68,14 @@ add_token_level_kl: false
 
 # advantage
 whiten_advantages: true
+entropy_top_ratio: 0.2
 
 # dynamic sampling scheduler
 # use_additional_prompts: true
 # max_running_requests: 256
 # is_num_return_sequences_expand: false
 
-pretrain: ./models/Qwen3-8B-Base
+pretrain: ./models/Qwen3-4B-Base
 reward_pretrain: ${pretrain}
 
 validation:
@@ -218,7 +219,7 @@ rewards:
     judge_model_type: inference
     tag_included: [RLVR]
     model_args:
-      model_name_or_path: ./models/Qwen2.5-7B-Instruct-RLVR
+      model_name_or_path:  ./models/Qwen2.5-7B-Instruct-RLVR
       attn_implementation: fa2
       disable_gradient_checkpointing: true
       dtype: bf16

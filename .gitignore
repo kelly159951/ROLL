@@ -1,3 +1,5 @@
+models/
+
 *.png
 *.pyc
 */checkpoint_dir
