@@ -514,6 +514,22 @@ class PPOConfig(BaseConfig):
             )
         },
     )
+    entropy_top_score_type: Literal["entropy", "semantic_entropy"] = field(
+        default="entropy",
+        metadata={"help": "Score used by entropy_top_ratio: ordinary entropy or semantic-entropy probe prediction."},
+    )
+    semantic_entropy_probe_model: str = field(
+        default="auto",
+        metadata={"help": "Semantic entropy probe model key. Use auto, qwen3-4b, or qwen3-8b."},
+    )
+    semantic_entropy_probe_dir: str = field(
+        default="./models/semantic_entropy_probes",
+        metadata={"help": "Directory containing semantic entropy probe .pt files."},
+    )
+    semantic_entropy_probe_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional explicit semantic entropy probe path. Overrides semantic_entropy_probe_dir."},
+    )
     advantage_clip: float = field(default=None, metadata={"help": "advantage_clip value"})
     adv_estimator: Literal["gae", "reinforce", "grpo", "gigpo", "step_reinforce", "agentic_reinforce"] = field(
         default="gae", metadata={"help": "advantage estimator: gae (GAE)."}
@@ -637,6 +653,8 @@ class PPOConfig(BaseConfig):
         if self.entropy_top_ratio is not None:
             if not 0 <= self.entropy_top_ratio <= 1:
                 raise ValueError(f"entropy_top_ratio must be in [0, 1], got {self.entropy_top_ratio}")
+            if self.entropy_top_score_type not in ("entropy", "semantic_entropy"):
+                raise ValueError(f"Unsupported entropy_top_score_type: {self.entropy_top_score_type}")
             if self.force_disable_old_logprobs_recompute:
                 raise ValueError("entropy_top_ratio requires enable_old_logprobs_recompute.")
             self.enable_old_logprobs_recompute = True

@@ -607,6 +607,9 @@ class RLVRPipeline(BasePipeline):
 
                         batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
                         batch.batch["old_entropy"] = old_log_probs.batch["entropy"]
+                        if "semantic_entropy" in old_log_probs.batch.keys():
+                            batch.batch["old_semantic_entropy"] = old_log_probs.batch["semantic_entropy"]
+                            batch.batch["old_semantic_entropy_mask"] = old_log_probs.batch["semantic_entropy_mask"]
                         metrics_mgr.add_reduced_metrics(old_log_probs.meta_info.pop("metrics", {}))
                     else:
                         # Use zeros when optimization is enabled

@@ -28,6 +28,7 @@ from roll.utils.dynamic_batching import make_mini_batch_iter_for_dynamic_batchin
 from roll.utils.functionals import agg_loss, append_to_dict, compute_approx_kl, flatten_sum, masked_mean, postprocess_generate, reduce_metrics
 from roll.utils.offload_nccl import reload_process_groups
 from roll.utils.offload_states import OffloadStateType
+from roll.utils.semantic_entropy_probe import SemanticEntropyProbe, semantic_entropy_top_enabled
 
 
 class ActorWorker(Worker):
@@ -36,6 +37,7 @@ class ActorWorker(Worker):
         self.tokenizer = None
         self.strategy: TrainStrategy = None
         self._logprobs_cache = {}
+        self._semantic_entropy_probe: Optional[SemanticEntropyProbe] = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def initialize(self, pipeline_config):
@@ -139,6 +141,13 @@ class ActorWorker(Worker):
             data = self.strategy.get_data_input(data)
             data = data.to(current_platform.device_type)
             data.meta_info["micro_batch_size"] = self.worker_config.infer_batch_size
+            semantic_probe = None
+            if not data.meta_info.get("disable_adapter", False):
+                semantic_probe = self._get_semantic_entropy_probe()
+            if semantic_probe is not None:
+                data.meta_info["semantic_entropy_probe_layer"] = semantic_probe.layer
+            else:
+                data.meta_info.pop("semantic_entropy_probe_layer", None)
 
             with torch.no_grad():
                 results: Dict[str, torch.Tensor] = self.strategy.forward_step(
@@ -146,11 +155,32 @@ class ActorWorker(Worker):
                 )
             if results is None:
                 return DataProto(batch=None, meta_info={"metrics": metrics})
-            output = DataProto.from_dict(tensors={"log_probs": results["log_probs"], "entropy": results["entropy"]})
+            output_tensors = {"log_probs": results["log_probs"], "entropy": results["entropy"]}
+            if "semantic_entropy" in results:
+                output_tensors["semantic_entropy"] = results["semantic_entropy"]
+                output_tensors["semantic_entropy_mask"] = results["semantic_entropy_mask"]
+            output = DataProto.from_dict(tensors=output_tensors)
             output = output.to("cpu")
             data.to("cpu")
         output.meta_info = {"metrics": metrics}
         return output
+
+    def _get_semantic_entropy_probe(self) -> Optional[SemanticEntropyProbe]:
+        if not semantic_entropy_top_enabled(self.pipeline_config):
+            return None
+        role_name = self.cluster_name or getattr(self.worker_config, "name", None)
+        if not str(role_name).startswith("actor_train"):
+            return None
+        if self._semantic_entropy_probe is None:
+            self._semantic_entropy_probe = SemanticEntropyProbe.from_pipeline_config(
+                self.pipeline_config,
+                device=current_platform.device_type,
+            )
+            self.logger.info(
+                f"Loaded semantic entropy probe from {self._semantic_entropy_probe.path} "
+                f"(model={self._semantic_entropy_probe.model_key}, layer={self._semantic_entropy_probe.layer})"
+            )
+        return self._semantic_entropy_probe
 
     def forward_func_log_probs(self, data: DataProto, output_tensor: torch.Tensor):
         """
@@ -162,7 +192,24 @@ class ActorWorker(Worker):
             logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=data.batch["response_mask"]
         )
         entropy = self.strategy.op_compute_entropy(logits=output_tensor, attention_mask=data.batch["response_mask"])
-        return torch.tensor(0., device=output_tensor.device), {"log_probs": log_probs.clone().detach(), "entropy": entropy.clone().detach()}
+        results = {"log_probs": log_probs.clone().detach(), "entropy": entropy.clone().detach()}
+
+        semantic_probe = self._get_semantic_entropy_probe() if "semantic_entropy_probe_layer" in data.meta_info else None
+        if semantic_probe is not None:
+            hidden_states = data.meta_info.pop("_semantic_entropy_hidden", None)
+            if hidden_states is None:
+                raise RuntimeError(
+                    "semantic_entropy top-ratio requires the train strategy to provide "
+                    "the configured layer hidden states."
+                )
+            semantic_entropy, semantic_entropy_mask = semantic_probe.score_response_tokens(
+                hidden_states=hidden_states,
+                response_mask=data.batch["response_mask"],
+            )
+            results["semantic_entropy"] = semantic_entropy.clone().detach()
+            results["semantic_entropy_mask"] = semantic_entropy_mask.clone().detach()
+
+        return torch.tensor(0., device=output_tensor.device), results
 
     def get_old_log_probs_with_cache(self, data: DataProto, log_probs: torch.Tensor) -> torch.Tensor:
         """

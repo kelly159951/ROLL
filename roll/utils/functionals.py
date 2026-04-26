@@ -860,11 +860,25 @@ def compute_advantage(
 
     entropy_top_ratio = getattr(pipeline_config, "entropy_top_ratio", None) if pipeline_config else None
     if entropy_top_ratio is not None:
-        if "old_entropy" not in data.batch.keys():
-            raise ValueError("entropy_top_ratio requires old_entropy in the batch.")
+        score_type = getattr(pipeline_config, "entropy_top_score_type", "entropy")
+        if score_type == "entropy":
+            score_key = "old_entropy"
+            score_mask = response_mask
+            metric_prefix = "critic/entropy_top"
+        elif score_type == "semantic_entropy":
+            score_key = "old_semantic_entropy"
+            if "old_semantic_entropy_mask" not in data.batch.keys():
+                raise ValueError("semantic_entropy top-ratio requires old_semantic_entropy_mask in the batch.")
+            score_mask = response_mask.bool() & data.batch["old_semantic_entropy_mask"].to(device=response_mask.device).bool()
+            metric_prefix = "critic/semantic_entropy_top"
+        else:
+            raise ValueError(f"Unsupported entropy_top_score_type: {score_type}")
+
+        if score_key not in data.batch.keys():
+            raise ValueError(f"entropy_top_ratio with {score_type} requires {score_key} in the batch.")
         entropy_top_mask = get_global_entropy_top_mask(
-            entropy=data.batch["old_entropy"].to(device=advantages.device),
-            response_mask=response_mask,
+            entropy=data.batch[score_key].to(device=advantages.device),
+            response_mask=score_mask,
             top_ratio=entropy_top_ratio,
         )
         advantages = advantages * entropy_top_mask.to(dtype=advantages.dtype)
@@ -872,8 +886,10 @@ def compute_advantage(
         metrics = data.meta_info.setdefault("metrics", {})
         selected_tokens = (entropy_top_mask & response_mask.bool()).sum().float()
         total_tokens = response_mask.sum().float()
-        metrics["critic/entropy_top_ratio"] = float(entropy_top_ratio)
-        metrics["critic/entropy_top_mask_ratio"] = (selected_tokens / torch.clamp(total_tokens, min=1.0)).item()
+        available_tokens = score_mask.sum().float()
+        metrics[f"{metric_prefix}_ratio"] = float(entropy_top_ratio)
+        metrics[f"{metric_prefix}_mask_ratio"] = (selected_tokens / torch.clamp(total_tokens, min=1.0)).item()
+        metrics[f"{metric_prefix}_available_ratio"] = (available_tokens / torch.clamp(total_tokens, min=1.0)).item()
 
     if advantage_clip is not None:
         adv_clip_frac = compute_clip_fraction(values=advantages, clip_min=-advantage_clip, clip_max=advantage_clip)

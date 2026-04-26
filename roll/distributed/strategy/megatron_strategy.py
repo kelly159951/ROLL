@@ -405,6 +405,44 @@ class MegatronInferStrategy(InferenceStrategy):
             local_chunk = output_tensor[:, seq_start:seq_end]
             yield local_chunk
 
+    def _register_semantic_entropy_hidden_hook(self, model, data: DataProto, input_ids: torch.Tensor):
+        layer_idx = data.meta_info.get("semantic_entropy_probe_layer", None)
+        if layer_idx is None:
+            return None, lambda: None
+        if self.use_sequence_packing:
+            raise NotImplementedError("semantic_entropy_probe_layer is not supported with sequence packing yet.")
+        if mpu.get_pipeline_model_parallel_world_size() != 1 or mpu.get_context_parallel_world_size() != 1:
+            # Current semantic probes are wired for the provided single-PP/single-CP configs.
+            # With PP/CP > 1, the target layer or sequence slice may live on another rank and needs an explicit gather.
+            raise NotImplementedError("semantic_entropy_probe_layer currently requires pipeline_parallel=1 and context_parallel=1.")
+
+        layer_idx = int(layer_idx)
+        module = model
+        while not hasattr(module, "decoder") and hasattr(module, "module"):
+            module = module.module
+        if not hasattr(module, "decoder") or not hasattr(module.decoder, "layers"):
+            raise RuntimeError("Could not find Megatron decoder layers for semantic entropy probe.")
+        if layer_idx < 0 or layer_idx >= len(module.decoder.layers):
+            raise RuntimeError(
+                f"Semantic entropy probe layer {layer_idx} is not present on this rank; "
+                f"local layer count is {len(module.decoder.layers)}."
+            )
+
+        captured = {"hidden": None}
+
+        def hook_fn(_module, _inputs, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            if hidden.ndim != 3:
+                raise RuntimeError(f"Unexpected semantic probe hidden rank: {hidden.shape}")
+            if hidden.shape[0] == input_ids.shape[1] and hidden.shape[1] == input_ids.shape[0]:
+                hidden = hidden.transpose(0, 1).contiguous()
+            elif hidden.shape[0] != input_ids.shape[0]:
+                raise RuntimeError(f"Unexpected semantic probe hidden layout: {hidden.shape}")
+            captured["hidden"] = hidden.detach()
+
+        handle = module.decoder.layers[layer_idx].register_forward_hook(hook_fn)
+        return captured, handle.remove
+
     def inner_forward_step(self, loss_func, data_iterator: Iterator[DataProto], model):
         data = next(data_iterator)
         input_ids = data.batch["input_ids"]
@@ -461,10 +499,14 @@ class MegatronInferStrategy(InferenceStrategy):
             else:
                 forward_args["loss_mask"] = torch.ones_like(input_ids)
 
-        output_tensor = model(
-            input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
-            packed_seq_params=packed_seq_params, **forward_args
-        )
+        semantic_hidden, remove_semantic_hook = self._register_semantic_entropy_hidden_hook(model, data, input_ids)
+        try:
+            output_tensor = model(
+                input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
+                packed_seq_params=packed_seq_params, **forward_args
+            )
+        finally:
+            remove_semantic_hook()
 
         if self.use_sequence_packing:
             cp_size = mpu.get_context_parallel_world_size()
@@ -506,6 +548,10 @@ class MegatronInferStrategy(InferenceStrategy):
             return output_tensor, loss_wrapper
         else:
             def loss_wrapper(output_tensor):
+                if semantic_hidden is not None:
+                    if semantic_hidden["hidden"] is None:
+                        raise RuntimeError("Semantic entropy probe hook did not capture hidden states.")
+                    data.meta_info["_semantic_entropy_hidden"] = semantic_hidden["hidden"]
                 loss, metrics = loss_func(data, output_tensor)
                 if self.worker_config.apply_loss_scale:
                     loss *= data.meta_info['loss_scale']
@@ -1267,7 +1313,13 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                             return_base_dir=self.megatron_train_args.use_distributed_optimizer)
         if self.megatron_train_args.use_distributed_optimizer:
             checkpoint_dir = os.path.join(checkpoint_dir, DIST_OPTIMIZER_DIR)
+            if dist.is_initialized():
+                obj_list = [checkpoint_dir if dist.get_rank() == 0 else None]
+                dist.broadcast_object_list(obj_list, src=0)
+                checkpoint_dir = obj_list[0]
         os.makedirs(checkpoint_dir, exist_ok=True)
+        if self.megatron_train_args.use_distributed_optimizer and dist.is_initialized():
+            dist.barrier()
         if self.megatron_train_args.use_distributed_optimizer:
             model_shared_state_dict = self.model.sharded_state_dict()
             optimizer_state_dict = self.optimizer.sharded_state_dict(
