@@ -803,10 +803,15 @@ def compute_advantage(
 ):
     if response_mask is None:
         response_mask = data.batch["response_mask"][:, 1:]
-    if response_mask.sum() == 0:
+    valid_response_tokens = response_mask.sum()
+    valid_response_token_count = valid_response_tokens.item()
+    if valid_response_token_count <= 1:
         whiten_rewards = False
         whiten_advantages = False
-        logger.info("Warning: domain final_response_mask.sum() == 0! All masked_whiten will be skipped.")
+        logger.info(
+            f"Warning: domain final_response_mask.sum() == {valid_response_token_count}! "
+            "All masked_whiten will be skipped."
+        )
 
     # Check OPD config
     is_pure_opd = getattr(pipeline_config, "is_pure_opd", False) if pipeline_config else False

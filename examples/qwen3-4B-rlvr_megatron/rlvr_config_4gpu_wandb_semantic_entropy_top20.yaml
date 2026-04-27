@@ -28,7 +28,7 @@ tracker_kwargs:
 
 num_gpus_per_node: 4
 
-max_steps: 400
+max_steps: 500
 save_steps: 100
 logging_steps: 1
 eval_steps: 10
