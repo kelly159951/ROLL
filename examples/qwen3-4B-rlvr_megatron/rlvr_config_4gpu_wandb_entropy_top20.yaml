@@ -40,9 +40,17 @@ response_length: 4096
 
 num_return_sequences_in_group: 4
 ppo_epochs: 1
-adv_estimator: "reinforce"
+adv_estimator: "grpo"
+loss_agg_mode: "token-mean"
+
+# DAPO-style no-KL setup.
+init_kl_coef: 0
+use_kl_loss: false
 
 # clip
+use_pg_clip_range: true
+pg_clip_low: 0.2
+pg_clip_high: 0.28
 value_clip: 0.5
 reward_clip: 10
 advantage_clip: 2.0

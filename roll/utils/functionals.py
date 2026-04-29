@@ -627,6 +627,7 @@ def get_global_entropy_top_mask(entropy: torch.Tensor, response_mask: torch.Tens
     return flat_out.view_as(response_mask)
 
 
+
 @torch.no_grad()
 def compute_token_reward(data: "DataProto", pipeline_config: PPOConfig, kl_ctrl: AdaptiveKLController):
     token_level_rewards = expand_to_token_level(data)
@@ -881,15 +882,28 @@ def compute_advantage(
 
         if score_key not in data.batch.keys():
             raise ValueError(f"entropy_top_ratio with {score_type} requires {score_key} in the batch.")
+        score_mask = score_mask.to(device=advantages.device)
         entropy_top_mask = get_global_entropy_top_mask(
             entropy=data.batch[score_key].to(device=advantages.device),
             response_mask=score_mask,
             top_ratio=entropy_top_ratio,
         )
-        advantages = advantages * entropy_top_mask.to(dtype=advantages.dtype)
+        entropy_top_mask = entropy_top_mask.to(device=advantages.device)
+        entropy_top_loss_mask = response_mask.bool() & entropy_top_mask.bool()
+        advantages = advantages * entropy_top_loss_mask.to(dtype=advantages.dtype)
+        if (
+            "final_response_mask" in data.batch.keys()
+            and data.batch["final_response_mask"].shape == entropy_top_loss_mask.shape
+        ):
+            data.batch["final_response_mask"] = (
+                data.batch["final_response_mask"].to(device=entropy_top_loss_mask.device).bool()
+                & entropy_top_loss_mask
+            ).to(dtype=data.batch["final_response_mask"].dtype)
+        else:
+            data.batch["final_response_mask"] = entropy_top_loss_mask
 
         metrics = data.meta_info.setdefault("metrics", {})
-        selected_tokens = (entropy_top_mask & response_mask.bool()).sum().float()
+        selected_tokens = entropy_top_loss_mask.sum().float()
         total_tokens = response_mask.sum().float()
         available_tokens = score_mask.sum().float()
         metrics[f"{metric_prefix}_ratio"] = float(entropy_top_ratio)
